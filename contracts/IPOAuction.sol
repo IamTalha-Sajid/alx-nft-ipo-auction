@@ -148,6 +148,87 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     uint256 public editCooldownPeriod;
 
+    /********** CUSTOM ERRORS **********/
+    /**
+     * @notice Thrown when an invalid address (zero address) is provided.
+     */
+    error InvalidAddress();
+
+    /**
+     * @notice Thrown when a function restricted to admin role is called by non-admin.
+     */
+    error AdminRoleRequired();
+
+    /**
+     * @notice Thrown when a function restricted to pauser role is called by non-pauser.
+     */
+    error PauserRoleRequired();
+
+    /**
+     * @notice Thrown when commit start/end times are invalid.
+     */
+    error InvalidCommitTimes();
+
+    /**
+     * @notice Thrown when commit start time is not in the future.
+     */
+    error CommitStartMustBeInFuture();
+
+    /**
+     * @notice Thrown when trying to use an unsupported currency for bidding.
+     */
+    error CurrencyNotSupported();
+
+    /**
+     * @notice Thrown when reserve price is zero or negative.
+     */
+    error ReserveMustBePositive();
+
+    /**
+     * @notice Thrown when bid cap is less than reserve price.
+     */
+    error CapMustBeGreaterThanOrEqualToReserve();
+
+    /**
+     * @notice Thrown when an invalid IPO ID is provided.
+     */
+    error InvalidIPOId();
+
+    /**
+     * @notice Thrown when trying to interact with IPO outside commit phase.
+     */
+    error NotInCommitPhase();
+
+    /**
+     * @notice Thrown when non-whitelisted address tries to participate.
+     */
+    error NotWhitelisted();
+
+    /**
+     * @notice Thrown when trying to place bid when active bid exists.
+     */
+    error ActiveBidExists();
+
+    /**
+     * @notice Thrown when trying to edit non-existent bid.
+     */
+    error NoActiveBidToEdit();
+
+    /**
+     * @notice Thrown when trying to edit bid before cooldown period expires.
+     */
+    error EditCooldown();
+
+    /**
+     * @notice Thrown when trying to cancel non-existent bid.
+     */
+    error NoActiveBidToCancel();
+
+    /**
+     * @notice Thrown when cooldown period is set to zero or negative.
+     */
+    error PeriodMustBePositive();
+
     /********** EVENTS **********/
     /**
      * @notice Emitted when a new IPO auction is created.
@@ -248,10 +329,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @dev Reverts if caller does not have admin role.
      */
     modifier onlyAdmin() {
-        require(
-            hasRole(ADMIN_ROLE, msg.sender),
-            "IPOAuction: admin role required"
-        );
+        if (!hasRole(ADMIN_ROLE, msg.sender)) {
+            revert AdminRoleRequired();
+        }
         _;
     }
 
@@ -260,10 +340,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @dev Reverts if caller does not have pauser role.
      */
     modifier onlyPauser() {
-        require(
-            hasRole(PAUSER_ROLE, msg.sender),
-            "IPOAuction: pauser role required"
-        );
+        if (!hasRole(PAUSER_ROLE, msg.sender)) {
+            revert PauserRoleRequired();
+        }
         _;
     }
 
@@ -499,10 +578,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
 
         BidMeta storage bid = bids[ipoId][msg.sender];
 
-        require(
-            bid.status == BidStatus.Committed,
-            "IPOAuction: No active bid to cancel"
-        );
+        if (bid.status != BidStatus.Committed) {
+            revert NoActiveBidToCancel();
+        }
 
         bid.status = BidStatus.Canceled;
         emit Canceled(ipoId, msg.sender);
@@ -565,7 +643,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param addr Address to validate
      */
     function _isValidAddress(address addr) internal pure {
-        require(addr != address(0), "IPOAuction: Invalid address");
+        if (addr == address(0)) {
+            revert InvalidAddress();
+        }
     }
 
     /**
@@ -574,11 +654,12 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param commitEnd End time of commit phase
      */
     function _isValidTime(uint64 commitStart, uint64 commitEnd) internal view {
-        require(commitStart < commitEnd, "IPOAuction: Invalid commit times");
-        require(
-            block.timestamp < commitStart,
-            "IPOAuction: Commit start must be in future"
-        );
+        if (commitStart >= commitEnd) {
+            revert InvalidCommitTimes();
+        }
+        if (block.timestamp >= commitStart) {
+            revert CommitStartMustBeInFuture();
+        }
     }
 
     /**
@@ -586,10 +667,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param currency ERC20 token address to validate
      */
     function _isValidCurrency(address currency) internal view {
-        require(
-            supportedCurrencies[currency],
-            "IPOAuction: Currency not supported"
-        );
+        if (!supportedCurrencies[currency]) {
+            revert CurrencyNotSupported();
+        }
     }
 
     /**
@@ -598,8 +678,12 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param cap Maximum allowed bid amount
      */
     function _isValidReserve(uint256 reserve, uint256 cap) internal pure {
-        require(reserve > 0, "IPOAuction: Reserve must be positive");
-        require(cap >= reserve, "IPOAuction: Cap must be >= reserve");
+        if (reserve == 0) {
+            revert ReserveMustBePositive();
+        }
+        if (cap < reserve) {
+            revert CapMustBeGreaterThanOrEqualToReserve();
+        }
     }
 
     /**
@@ -607,7 +691,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param ipoId ID of the IPO to validate
      */
     function _isValidIPOId(uint256 ipoId) internal view {
-        require(ipoId < ipoCounter, "IPOAuction: Invalid IPO ID");
+        if (ipoId >= ipoCounter) {
+            revert InvalidIPOId();
+        }
     }
 
     /**
@@ -616,11 +702,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     function _isValidPhaseToCommit(uint256 ipoId) internal view {
         IPO storage ipo = ipos[ipoId];
-        require(
-            block.timestamp >= ipo.commitStart &&
-                block.timestamp < ipo.commitEnd,
-            "IPOAuction: Not in commit phase"
-        );
+        if (block.timestamp < ipo.commitStart || block.timestamp >= ipo.commitEnd) {
+            revert NotInCommitPhase();
+        }
     }
 
     /**
@@ -629,10 +713,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param bidder Address of the bidder to check
      */
     function _isWhitelisted(uint256 ipoId, address bidder) internal view {
-        require(
-            whitelistProvider.isAllowed(ipoId, bidder),
-            "IPOAuction: Not whitelisted"
-        );
+        if (!whitelistProvider.isAllowed(ipoId, bidder)) {
+            revert NotWhitelisted();
+        }
     }
 
     /**
@@ -642,10 +725,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     function _hasNoActiveBid(uint256 ipoId, address bidder) internal view {
         BidMeta storage bid = bids[ipoId][bidder];
-        require(
-            bid.status == BidStatus.None || bid.status == BidStatus.Canceled,
-            "IPOAuction: Active bid exists"
-        );
+        if (bid.status != BidStatus.None && bid.status != BidStatus.Canceled) {
+            revert ActiveBidExists();
+        }
     }
 
     /**
@@ -655,16 +737,14 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     function _isValidBidToEdit(uint256 ipoId, address bidder) internal view {
         BidMeta storage bid = bids[ipoId][bidder];
-        require(
-            bid.status == BidStatus.Committed,
-            "IPOAuction: No active bid to edit"
-        );
+        if (bid.status != BidStatus.Committed) {
+            revert NoActiveBidToEdit();
+        }
 
         uint256 lastEdit = lastEditAt[ipoId][msg.sender];
-        require(
-            block.timestamp >= lastEdit + editCooldownPeriod,
-            "IPOAuction: Edit cooldown"
-        );
+        if (block.timestamp < lastEdit + editCooldownPeriod) {
+            revert EditCooldown();
+        }
     }
 
     /**
@@ -674,10 +754,9 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     function _isValidBidToCancel(uint256 ipoId, address bidder) internal view {
         BidMeta storage bid = bids[ipoId][bidder];
-        require(
-            bid.status == BidStatus.Committed,
-            "IPOAuction: No active bid to cancel"
-        );
+        if (bid.status != BidStatus.Committed) {
+            revert NoActiveBidToCancel();
+        }
     }
 
     /**
@@ -685,6 +764,8 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      * @param period Period to validate
      */
     function _isValidPeriod(uint256 period) internal pure {
-        require(period > 0, "IPOAuction: period must be positive");
+        if (period == 0) {
+            revert PeriodMustBePositive();
+        }
     }
 }
