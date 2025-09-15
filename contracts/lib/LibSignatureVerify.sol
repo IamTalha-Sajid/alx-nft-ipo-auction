@@ -20,7 +20,7 @@ library LibSignatureVerify {
     /// @dev Type hash for ALX Score attestation struct following EIP-712 standard.
     bytes32 private constant _ALX_SCORE_ATTEST_TYPEHASH =
         keccak256(
-            "ALXScoreAttestation(address wallet,uint256 score,uint256 epochId,uint256 nonce,uint256 deadline)"
+            "ALXScoreAttestation(address wallet,uint256 score,uint256 epochId,uint256 amount,uint256 nonce,uint256 deadline)"
         );
 
     /**
@@ -30,6 +30,7 @@ library LibSignatureVerify {
      * @param wallet The address of the wallet whose score is being verified.
      * @param score The ALX Score being attested to (must match signature).
      * @param epochId The epoch ID for the score.
+     * @param amount The amount being attested to.
      * @param nonce The nonce for replay protection.
      * @param deadline The deadline for the signature validity.
      * @param signature The EIP-712 signature from the ALX backend signer.
@@ -50,6 +51,7 @@ library LibSignatureVerify {
         address wallet,
         uint256 score,
         uint256 epochId,
+        uint256 amount,
         uint256 nonce,
         uint256 deadline,
         bytes calldata signature,
@@ -69,6 +71,7 @@ library LibSignatureVerify {
                 wallet,
                 score,
                 epochId,
+                amount,
                 nonce,
                 deadline
             )

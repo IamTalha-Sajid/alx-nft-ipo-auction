@@ -6,8 +6,6 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/security/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
-import "@openzeppelin/contracts/utils/Context.sol";
-import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "./interfaces/IWhitelistProvider.sol";
 import "./lib/LibSignatureVerify.sol";
 
@@ -16,15 +14,26 @@ import "./lib/LibSignatureVerify.sol";
  * @notice A smart contract for managing IPO sealed-bid auctions with commit-reveal mechanism
  * @dev Implements second-price auction with commit-reveal mechanism
  */
-contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
-    /**
-     * @dev Utility library for cryptographic signature operations.
-     */
-    using ECDSA for bytes32;
+contract IPOAuction is AccessControl, ReentrancyGuard, Pausable {
 
     /********** ROLES **********/
+    /**
+     * @notice Role identifier for admin access.
+     * @dev Grants access to administrative functions like creating IPOs and managing roles.
+     */
     bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+
+    /**
+     * @notice Role identifier for pause control.
+     * @dev Grants access to pause/unpause contract functionality.
+     */
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
+
+    /**
+     * @notice Role identifier for relayer access.
+     * @dev Grants access to relay transactions on behalf of users.
+     */
+    bytes32 public constant RELAYER_ROLE = keccak256("RELAYER_ROLE");
 
     /********** ENUMS **********/
     /**
@@ -45,19 +54,10 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
     enum BidStatus {
         None,
         Committed,
+        Revealed,
         Canceled
     }
 
-    /**
-     * @notice Represents the reason for a bidder default during settlement.
-     * @dev Used to track why a bidder failed to complete settlement.
-     */
-    enum DefaultReason {
-        None,
-        InsufficientBalance,
-        InsufficientAllowance,
-        TransferFailed
-    }
 
     /********** STRUCTS **********/
     /**
@@ -73,8 +73,8 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
         uint256 reserve;
         uint256 cap;
         bool settled;
+        winnerBid winnerBid;
         uint32 commitCount;
-        uint32 revealCount;
     }
 
     /**
@@ -85,6 +85,30 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
         bytes32 commitHash;
         uint64 commitTime;
         BidStatus status;
+    }
+
+    /**
+     * @notice Contains metadata about a single bid for verification.
+     * @dev Tracks bid details and state.
+     */
+    struct bidVerifyingMeta {
+        address wallet;
+        uint256 score;
+        uint256 epochId;
+        uint256 amount;
+        uint256 nonce;
+        uint256 deadline;
+    }
+
+    /**
+     * @notice Contains metadata about a single winner bid.
+     * @dev Tracks winner bid details and state.
+     */
+    struct winnerBid {
+        address wallet;
+        uint256 amount;
+        uint256 score;
+        uint256 epochId;
     }
 
     /********** STATE VARIABLES **********/
@@ -165,6 +189,11 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
     error PauserRoleRequired();
 
     /**
+     * @notice Thrown when a function restricted to relayer role is called by non-relayer.
+     */
+    error RelayerRoleRequired();
+
+    /**
      * @notice Thrown when commit start/end times are invalid.
      */
     error InvalidCommitTimes();
@@ -229,6 +258,16 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     error PeriodMustBePositive();
 
+    /**
+     * @notice Thrown when an invalid bid signature is provided.
+     */
+    error InvalidBidSignature();
+
+    /**
+     * @notice Thrown when the seller has not approved this contract for the specific token.
+     */
+    error InvalidSellerApproval();
+
     /********** EVENTS **********/
     /**
      * @notice Emitted when a new IPO auction is created.
@@ -271,23 +310,6 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     event Canceled(uint256 indexed ipoId, address indexed bidder);
 
-    /**
-     * @notice Emitted when settlement starts.
-     * @param ipoId ID of the IPO.
-     */
-    event SettlementStarted(uint256 indexed ipoId);
-
-    /**
-     * @notice Emitted when a settlement attempt fails.
-     * @param ipoId ID of the IPO.
-     * @param bidder Address of the failing bidder.
-     * @param reason Reason for failure.
-     */
-    event FailedAttempt(
-        uint256 indexed ipoId,
-        address indexed bidder,
-        string reason
-    );
 
     /**
      * @notice Emitted when a winner is determined.
@@ -342,6 +364,17 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
     modifier onlyPauser() {
         if (!hasRole(PAUSER_ROLE, msg.sender)) {
             revert PauserRoleRequired();
+        }
+        _;
+    }
+
+    /**
+     * @notice Restricts function access to accounts with relayer role.
+     * @dev Reverts if caller does not have relayer role.
+     */
+    modifier onlyRelayer() {
+        if (!hasRole(RELAYER_ROLE, msg.sender)) {
+            revert RelayerRoleRequired();
         }
         _;
     }
@@ -402,6 +435,7 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
         _isValidCurrency(currency);
         _isValidTime(commitStart, commitEnd);
         _isValidReserve(reserve, cap);
+        _isValidSellerApproval(tokenId);
 
         uint256 ipoId = ipoCounter;
         ipoCounter++;
@@ -415,8 +449,13 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
             reserve: reserve,
             cap: cap,
             settled: false,
-            commitCount: 0,
-            revealCount: 0
+            winnerBid: winnerBid({
+                wallet: address(0),
+                amount: 0,
+                score: 0,
+                epochId: 0
+            }),
+            commitCount: 0
         });
 
         emit IPOCreated(
@@ -427,6 +466,72 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
             cap,
             commitStart,
             commitEnd
+        );
+    }
+
+    /**
+     * @notice Settle an IPO auction
+     * @param ipoId ID of the IPO to settle
+     * @param winningBid Winning bid metadata
+     * @param winningBidSignature Winning bid signature
+     * @param RunnerUpBid Runner-up bid metadata
+     * @param RunnerUpBidSignature Runner-up bid signature
+     */
+    function settleIPO(
+        uint256 ipoId,
+        bidVerifyingMeta memory winningBid,
+        bytes calldata winningBidSignature,
+        bidVerifyingMeta memory RunnerUpBid,
+        bytes calldata RunnerUpBidSignature
+    ) external onlyRelayer {
+        _isValidIPOId(ipoId);
+        _isWhitelisted(ipoId, winningBid.wallet);
+        _isValidPhaseToSettle(ipoId);
+        _isValidBidToSettle(ipoId, winningBid.wallet, winningBid.amount);
+
+        _verifyALXScoreSignature(winningBid, winningBidSignature);
+        _verifyALXScoreSignature(RunnerUpBid, RunnerUpBidSignature);
+
+        IPO storage ipo = ipos[ipoId];
+
+        // Second-price auction: winner pays max(second-highest bid, reserve)
+        uint256 clearingPrice = RunnerUpBid.amount > ipo.reserve
+            ? RunnerUpBid.amount
+            : ipo.reserve;
+
+        IERC20(ipo.currency).transferFrom(
+            winningBid.wallet,
+            ipo.seller,
+            clearingPrice
+        );
+
+        IERC721(asset).safeTransferFrom(
+            ipo.seller,
+            winningBid.wallet,
+            ipo.tokenId
+        );
+
+        ipo.settled = true;
+
+        ipo.winnerBid = winnerBid({
+            wallet: winningBid.wallet,
+            amount: winningBid.amount,
+            score: winningBid.score,
+            epochId: winningBid.epochId
+        });
+
+        bids[ipoId][winningBid.wallet].status = BidStatus.Revealed;
+
+        emit WinnerFinal(ipoId, winningBid.wallet, clearingPrice);
+        emit AuctionOutcome(
+            ipoId,
+            asset,
+            ipo.tokenId,
+            ipo.currency,
+            clearingPrice,
+            true,
+            winningBid.wallet,
+            ipo.seller
         );
     }
 
@@ -527,7 +632,6 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
         _isWhitelisted(ipoId, msg.sender);
         _hasNoActiveBid(ipoId, msg.sender);
 
-        IPO storage ipo = ipos[ipoId];
         BidMeta storage bid = bids[ipoId][msg.sender];
 
         bid.commitHash = commitHash;
@@ -535,7 +639,7 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
         bid.status = BidStatus.Committed;
 
         biddersByIPO[ipoId].push(msg.sender);
-        ipo.commitCount++;
+        ipos[ipoId].commitCount++;
 
         emit Committed(ipoId, msg.sender);
     }
@@ -636,6 +740,25 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
         return biddersByIPO[ipoId];
     }
 
+    /**
+     * @notice Get revealed winner details for a specific IPO.
+     * @param ipoId ID of the IPO.
+     * @return Winner bid details including wallet, amount, score, and epochId.
+     * @dev Only returns data if IPO is settled and winner is revealed.
+     */
+    function getWinnerDetails(
+        uint256 ipoId
+    ) external view returns (winnerBid memory) {
+        _isValidIPOId(ipoId);
+        IPO storage ipo = ipos[ipoId];
+
+        if (!ipo.settled) {
+            revert InvalidIPOId(); // Using existing error for not settled
+        }
+
+        return ipo.winnerBid;
+    }
+
     /********** INTERNAL FUNCTIONS **********/
 
     /**
@@ -702,7 +825,10 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
      */
     function _isValidPhaseToCommit(uint256 ipoId) internal view {
         IPO storage ipo = ipos[ipoId];
-        if (block.timestamp < ipo.commitStart || block.timestamp >= ipo.commitEnd) {
+        if (
+            block.timestamp < ipo.commitStart ||
+            block.timestamp >= ipo.commitEnd
+        ) {
             revert NotInCommitPhase();
         }
     }
@@ -766,6 +892,77 @@ contract IPOAuction is Context, AccessControl, ReentrancyGuard, Pausable {
     function _isValidPeriod(uint256 period) internal pure {
         if (period == 0) {
             revert PeriodMustBePositive();
+        }
+    }
+
+    /**
+     * @notice Validate that the current time is within the settlement phase
+     * @param ipoId ID of the IPO to validate
+     */
+    function _isValidPhaseToSettle(uint256 ipoId) internal view {
+        IPO storage ipo = ipos[ipoId];
+        if (block.timestamp < ipo.commitEnd) {
+            revert NotInCommitPhase();
+        }
+        if (ipo.settled) {
+            revert InvalidIPOId(); // Using existing error for settled IPO
+        }
+    }
+
+    /**
+     * @notice Validate that the bidder has an active bid to settle
+     * @param ipoId ID of the IPO to validate
+     * @param bidder Address of the bidder to check
+     * @param amount Bid amount to validate against reserve and cap
+     */
+    function _isValidBidToSettle(
+        uint256 ipoId,
+        address bidder,
+        uint256 amount
+    ) internal view {
+        BidMeta storage bid = bids[ipoId][bidder];
+        if (bid.status != BidStatus.Committed) {
+            revert NoActiveBidToEdit(); // Using existing error for no active bid
+        }
+
+        IPO storage ipo = ipos[ipoId];
+        if (amount < ipo.reserve || amount > ipo.cap) {
+            revert CapMustBeGreaterThanOrEqualToReserve(); // Using existing error for range validation
+        }
+    }
+
+    /**
+     * @notice Verify ALX Score signature for bid verification
+     * @param bidMeta Bid verification metadata containing score and signature data
+     * @param signature EIP-712 signature to verify
+     */
+    function _verifyALXScoreSignature(
+        bidVerifyingMeta memory bidMeta,
+        bytes calldata signature
+    ) internal view returns (bool) {
+        bool isValid = LibSignatureVerify.verifyALXScore(
+            bidMeta.wallet,
+            bidMeta.score,
+            bidMeta.epochId,
+            bidMeta.amount,
+            bidMeta.nonce,
+            bidMeta.deadline,
+            signature,
+            trustedSigner,
+            address(this)
+        );
+
+        return isValid;
+    }
+
+    /**
+     * @notice Validate that the seller has approved this contract for the specific token
+     * @param tokenId ID of the token to check approval for
+     */
+    function _isValidSellerApproval(uint256 tokenId) internal view {
+        address approvedAddress = IERC721(asset).getApproved(tokenId);
+        if (approvedAddress != address(this)) {
+            revert InvalidSellerApproval();
         }
     }
 }
